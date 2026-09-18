@@ -113,7 +113,7 @@ def _upstream_tip(sha):
 def test_check_via_rev_recovers_exact_count():
     with _upstream_tip(SHA_B), patch.object(banner, "_github_compare_behind", return_value=61) as compare:
         assert banner._check_via_rev(SHA_A) == 61
-    compare.assert_called_once_with(SHA_A, SHA_B)
+    compare.assert_called_once_with(SHA_A, SHA_B, None)
 
 
 def test_check_via_rev_falls_back_to_sentinel_offline():

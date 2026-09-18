@@ -222,19 +222,26 @@ def _is_full_sha(value: Optional[str]) -> bool:
 _compare_payload_cache: Dict[tuple, dict] = {}
 
 
-def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
+def _github_compare(current_rev: str, target_rev: str, repo_slug: Optional[str] = None) -> Optional[dict]:
     """Compare payload for ``current...target`` from the GitHub API; memoized per process.
 
     Shallow installer clones and API-only probes know the two tip SHAs but have no local history
     to run ``rev-list --count`` or ``git log`` across; the payload carries both the count
     (``ahead_by``) and the commit list the dashboard/desktop render as "what's changed".
+
+    ``repo_slug`` (``owner/repo``) defaults to the official repo, but a fork's ahead/behind
+    relationship between two SHAs is computed against ITS OWN ref graph, not the official repo's —
+    forks share objects with upstream, so the official endpoint can still resolve both SHAs and
+    answer with a number, just the wrong one (#comparing a fork's own history through upstream's
+    topology). Callers that know the checkout's real origin/upstream slug should pass it.
     """
     if not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
         return None
-    key = (current_rev, target_rev)
+    slug = repo_slug or _OFFICIAL_REPO_CANONICAL.removeprefix("github.com/")
+    key = (slug, current_rev, target_rev)
     if key in _compare_payload_cache:
         return _compare_payload_cache[key]
-    url = f"https://api.github.com/repos/nousresearch/hermes-agent/compare/{current_rev}...{target_rev}"
+    url = f"https://api.github.com/repos/{slug}/compare/{current_rev}...{target_rev}"
 
     def _fetch():
         import urllib.request
@@ -250,9 +257,9 @@ def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     return payload
 
 
-def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
+def _github_compare_behind(current_rev: str, target_rev: str, repo_slug: Optional[str] = None) -> Optional[int]:
     """Exact behind-count via the GitHub compare API for uncountable graphs."""
-    payload = _github_compare(current_rev, target_rev)
+    payload = _github_compare(current_rev, target_rev, repo_slug)
     ahead = payload.get("ahead_by") if payload else None
     return ahead if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0 else None
 
@@ -287,20 +294,22 @@ def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
     return rows[:n]
 
 
-def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: Optional[Path] = None) -> Optional[int]:
+def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: Optional[Path] = None,
+                  repo_slug: Optional[str] = None) -> Optional[int]:
     """Behind-count from two tip SHAs: None if either is unknown, 0 when equal, else count/sentinel.
 
     With ``repo_dir``, a target that is already an ancestor of HEAD (local-ahead checkout) is 0 too.
     ``ahead_by == 0`` with differing tips means the remote tip is reachable from our HEAD — NOT
     behind. A local-only HEAD 404s on the API, which degrades to ``UPDATE_AVAILABLE_NO_COUNT`` —
-    never a fabricated 1.
+    never a fabricated 1. ``repo_slug`` is the checkout's own origin/upstream repo (see
+    ``_github_compare``'s docstring for why the official repo is the wrong graph for a fork).
     """
     if not head_rev or not target_rev:
         return None
     if head_rev == target_rev or (repo_dir is not None and _git_ok(
             ["merge-base", "--is-ancestor", target_rev, "HEAD"], cwd=repo_dir)):
         return 0
-    counted = _github_compare_behind(head_rev, target_rev)
+    counted = _github_compare_behind(head_rev, target_rev, repo_slug)
     return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
@@ -354,8 +363,10 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     if not head_rev:
         return None
     canonical = _canonical_github_remote(origin_url)
+    repo_slug = None
     if canonical.startswith("github.com/"):
-        target_rev = _github_branch_tip(canonical.removeprefix("github.com/"), "main")
+        repo_slug = canonical.removeprefix("github.com/")
+        target_rev = _github_branch_tip(repo_slug, "main")
     else:
         # Non-GitHub origin: one ls-remote for the tip (ref advertisement only, no pack transfer).
         result = _git_run(["ls-remote", "origin", "refs/heads/main"], cwd=repo_dir, timeout=10, network=True)
@@ -364,8 +375,9 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     _last_target_rev = target_rev
     # Tip SHAs alone can't distinguish "behind" from a local commit AHEAD of origin/main, and
     # misreporting an ahead checkout nudges the user into `hermes update`, which can wipe carried
-    # work — hence the ancestor check inside _tips_behind, against the FRESH upstream SHA.
-    return _tips_behind(head_rev, target_rev, repo_dir)
+    # work — hence the ancestor check inside _tips_behind, against the FRESH upstream SHA. A fork's
+    # own repo_slug keeps the uncountable-graph fallback on the SAME graph the tip came from.
+    return _tips_behind(head_rev, target_rev, repo_dir, repo_slug)
 
 
 def _read_json(path: Path) -> Optional[dict]:
